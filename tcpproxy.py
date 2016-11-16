@@ -83,6 +83,9 @@ class ParsableMixin:
 
 
 class OSReadWriteMixin:
+    def __init__(self):
+        self.send_buffers = {}
+
     @staticmethod
     def _read_chunk(fd):
         chunk = b''
@@ -215,6 +218,7 @@ class UserServer:
 # main proxy server
 class ProxyServer(OSReadWriteMixin):
     def __init__(self, ip, port):
+        OSReadWriteMixin.__init__(self)
         self.ip = ip
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -223,7 +227,7 @@ class ProxyServer(OSReadWriteMixin):
         self.user_conns = {}
         self.user_servers = {}
         self.user_port_range = (10000, 20000)
-        self.send_buffers = {}
+        # self.send_buffers = {}
         self.user_fd_close_list = set()
         self.last_heartbeat_check_time = time.time()
 
@@ -406,7 +410,7 @@ class ProxyServer(OSReadWriteMixin):
 # proxy client
 class Client(ParsableMixin, OSReadWriteMixin):
     def __init__(self, server_ip, server_port, app_ip, app_port):
-        super().__init__()
+        OSReadWriteMixin.__init__(self)
         self.server_ip = server_ip
         self.server_port = server_port
         self.app_ip = app_ip
@@ -417,7 +421,7 @@ class Client(ParsableMixin, OSReadWriteMixin):
         self.user_fd_map = {}  # user fd => app socket fd
         self.app_conn_map = {}  # app socket fd => user fd
         self.app_port_range = (10000, 20000)
-        self.send_buffers = {}
+        # self.send_buffers = {}
         self.readbuffer = b''
         self.app_fd_close_list = set()
         self.last_heartbeat_time = time.time()
