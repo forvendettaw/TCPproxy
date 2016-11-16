@@ -5,6 +5,7 @@ import struct
 import random
 import os
 import sys
+import time
 
 
 def log(*args, brief=True):
@@ -28,8 +29,10 @@ COMMAND_NEW_FAILED = 3
 COMMAND_PROXY = 4
 COMMAND_USER_GONE = 5
 COMMAND_APP_GONE = 6
+COMMAND_HEARTBEAT_PING = 7
 
 HEADER_LENGTH = 9
+HEARTBEAT_INTERVAL = 40
 
 
 # BEFORE_HANDSHAKE = 0
@@ -74,12 +77,14 @@ class ParsableMixin:
         #     log("not whole header")
         return None
 
-    def _package(self, command, user_fd, data=b''):
+    @staticmethod
+    def _package(command, user_fd, data=b''):
         return struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
 
 
 class OSReadWriteMixin:
-    def _read_chunk(self, fd):
+    @staticmethod
+    def _read_chunk(fd):
         chunk = b''
         try:
             while True:  # read all data currently available
@@ -111,6 +116,7 @@ class ClientConnection(BaseConnection, ParsableMixin):
         super().__init__(sock)
         self.server = server
         self.user_server = None
+        self.last_heartbeat_time = time.time()
 
     def recv(self, new_data):
         self.readbuffer += new_data
@@ -129,10 +135,11 @@ class ClientConnection(BaseConnection, ParsableMixin):
 
         if command == COMMAND_NEW_REQUEST:  # new proxy request
             log("should add a new user port")
-            user_server = self.server.add_user_server(self.fileno())
+            user_server, port = self.server.add_user_server(self.fileno())
             if user_server:
                 self.user_server = user_server
-                response = self._package(COMMAND_NEW_ACCEPT, 0, b'')
+                log("new port is {}".format(port))
+                response = self._package(COMMAND_NEW_ACCEPT, 0, struct.pack('!H', port))
             else:
                 response = self._package(COMMAND_NEW_FAILED, 0, b'')
             self.server.send_data(self.fileno(), response)
@@ -142,6 +149,9 @@ class ClientConnection(BaseConnection, ParsableMixin):
         elif command == COMMAND_APP_GONE:
             log("app close socket for user {}".format(header['user_fd']))
             self.server.app_gone(header['user_fd'])
+        elif command == COMMAND_HEARTBEAT_PING:
+            log("client send heartbeat")
+            self.last_heartbeat_time = time.time()
 
     def user_gone(self, fd):
         log("user {} closed, notify the client: {}".format(fd, self.fileno()))
@@ -215,24 +225,27 @@ class ProxyServer(OSReadWriteMixin):
         self.user_port_range = (10000, 20000)
         self.send_buffers = {}
         self.user_fd_close_list = set()
+        self.last_heartbeat_check_time = time.time()
 
     def add_user_server(self, fd):
         log("{} wants to add a new user server".format(fd))
         s = self._new_user_server_socket()
+        if not s:
+            return None, None
         user_server = UserServer(s, fd)
         self.user_servers[s.fileno()] = user_server
         log("new user server socket: {}".format(s))
         self.selectors.register(s.fileno(), selectors.EVENT_READ)
         log(self.user_servers)
-        return user_server
+        return user_server, s.getsockname()[1]
 
     def _new_user_server_socket(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setblocking(False)
         for i in range(0, 20):
             try:
-                # port = random.randint(self.user_port_range[0], self.user_port_range[1])
-                port = 12345  # TODO: change this
+                port = random.randint(self.user_port_range[0], self.user_port_range[1])
+                # port = 12345  # TODO: change this
                 s.bind((self.ip, port))
                 s.listen(5)
                 return s
@@ -265,13 +278,13 @@ class ProxyServer(OSReadWriteMixin):
         self.sock.bind((self.ip, self.port))
         self.sock.listen(5)
 
-        self.selectors.register(self.sock.fileno(), selectors.EVENT_READ)  # TODO: wrap selector to work with exceptions
+        self.selectors.register(self.sock.fileno(), selectors.EVENT_READ)
 
         log("start listening on port {}".format(self.port))
         while True:
             log("=========\nwaiting for I/O")
             log("memory usage: {}".format(self._show_memory()))
-            for key, event in self.selectors.select(30):
+            for key, event in self.selectors.select(60):
                 fd = key.fileobj
 
                 if event == selectors.EVENT_READ:
@@ -318,7 +331,7 @@ class ProxyServer(OSReadWriteMixin):
                         if self.send_buffers[fd] == b'':
                             self.selectors.modify(fd, selectors.EVENT_READ)
 
-            # TODO:need a thread to check heartbeats
+            # TODO:check heartbeats
             self._check_heartbeats()
 
             # close listed user conns
@@ -335,7 +348,13 @@ class ProxyServer(OSReadWriteMixin):
             log(self.user_fd_close_list)
 
     def _check_heartbeats(self):
-        pass
+        now = time.time()
+        if now > self.last_heartbeat_check_time + HEARTBEAT_INTERVAL + 20:
+            for fd in list(self.client_conns.keys()):
+                client_conn = self.client_conns[fd]
+                if now > client_conn.last_heartbeat_time + HEARTBEAT_INTERVAL + 10:
+                    self._close_client(fd)
+            self.last_heartbeat_check_time = now
 
     def _close_client(self, fd):
         log("client closed")
@@ -401,6 +420,7 @@ class Client(ParsableMixin, OSReadWriteMixin):
         self.send_buffers = {}
         self.readbuffer = b''
         self.app_fd_close_list = set()
+        self.last_heartbeat_time = time.time()
 
     def _recv(self, new_data):
         self.readbuffer += new_data
@@ -415,14 +435,18 @@ class Client(ParsableMixin, OSReadWriteMixin):
         log("processing packet: {}".format(packet))
         header = packet[0]
         data = packet[1]
+        command = header['command']
 
-        if header['command'] == COMMAND_NEW_FAILED:  # new proxy request
+        if command == COMMAND_NEW_FAILED:  # new proxy request
             log("server refused")
             sys.exit(1)
-        elif header['command'] == COMMAND_PROXY:
+        elif command == COMMAND_NEW_ACCEPT:
+            port = struct.unpack('!H', data)[0]
+            log("user server port is {}".format(port))
+        elif command == COMMAND_PROXY:
             log("should proxy the data: {}".format(data))
             self._send_app_data(header['user_fd'], data)
-        elif header['command'] == COMMAND_USER_GONE:
+        elif command == COMMAND_USER_GONE:
             user_fd = header['user_fd']
             app_fd = self.user_fd_map.get(user_fd, None)
             if app_fd is None:
@@ -502,7 +526,7 @@ class Client(ParsableMixin, OSReadWriteMixin):
         log("start proxy for {}:{}".format(self.app_ip, self.app_port))
         while True:
             log("=========\nwaiting for I/O")
-            for key, event in self.selectors.select(400):
+            for key, event in self.selectors.select(20):
                 fd = key.fileobj
                 # log(fd, event)
 
@@ -535,7 +559,7 @@ class Client(ParsableMixin, OSReadWriteMixin):
                     log("surprise event??? fd: {}, event: {}".format(fd, event))
                     self.selectors.unregister(fd)
 
-            # TODO:send hearbeat
+            # send hearbeat
             self._send_heartbeat()
 
             # close listed app conns
@@ -552,9 +576,14 @@ class Client(ParsableMixin, OSReadWriteMixin):
             log(self.app_fd_close_list)
 
     def _send_heartbeat(self):
-        pass
+        now = time.time()
+        if now > self.last_heartbeat_time + HEARTBEAT_INTERVAL:
+            log("send heartbeat")
+            self._send_command(self._package(COMMAND_HEARTBEAT_PING, 0))
+            self.last_heartbeat_time = now
 
-    def _close_server(self):
+    @staticmethod
+    def _close_server():
         log("server closed")
         sys.exit(1)
 
