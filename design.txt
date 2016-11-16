@@ -1,0 +1,20 @@
+command| checksum| user fd| length| body|
+	1  | 	2    |     2    |    4  |  ...|
+
+
+checksum calculation: set checksum to 0x0000, calculate substr(md5($wholePackage . $password, true), 0, 2) then set checksum
+
+// 客户端流程
+1.客户端请求建立连接 client:xxxx -> server:8080
+2.服务端返回连接信息 server:8080 -> client:xxxx 	访问域名, token
+3.开启新线程，定时发送心跳包
+4.收到服务端内容，转发给本地端口
+5.收到本地端口内容，转发给服务端
+
+
+// 服务端流程
+1.8080端口建立nonblocking socket。等待连接
+2.收到客户端连接，建立user server并返回结果
+3.用户连接收到信息，打包转发给客户端
+4.客户端收到信息，解包发送给用户
+5.定时检测心跳包

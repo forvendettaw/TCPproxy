@@ -7,6 +7,13 @@ import os
 import sys
 
 
+def log(*args, brief=True):
+    for arg in args:
+        if brief and isinstance(arg, str) and len(arg) > 100:
+            arg = arg[:100].encode() + b'...'
+        print(arg)
+
+
 class SocketBrokenException(Exception):
     pass
 
@@ -20,6 +27,7 @@ COMMAND_NEW_ACCEPT = 2
 COMMAND_NEW_FAILED = 3
 COMMAND_PROXY = 4
 COMMAND_USER_GONE = 5
+COMMAND_APP_GONE = 6
 
 HEADER_LENGTH = 9
 
@@ -42,25 +50,10 @@ class BaseConnection:
     def recv(self, new_data):
         pass
 
-    def _package(self, command, user_fd, data):
-        return struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
 
-
-# connection from proxy client
-class ClientConnection(BaseConnection):
-    def __init__(self, sock, server):
-        super().__init__(sock)
-        self.server = server
-        self.user_server = None
-
-    def recv(self, new_data):
-        self.readbuffer += new_data
-        packet = self._parse()
-        if packet:
-            self.process(packet)
-
-    def _parse(self):  # TODO: should be put in a while loop ??
-        print("parsing protocol")
+class ParsableMixin:
+    def _parse(self):
+        log("parsing protocol")
         if len(self.readbuffer) >= HEADER_LENGTH:
             command, checksum, user_fd, data_length = struct.unpack('!BHHL', self.readbuffer[:HEADER_LENGTH])
             header = {
@@ -75,19 +68,67 @@ class ClientConnection(BaseConnection):
                 data = self.readbuffer[HEADER_LENGTH: package_length]
                 self.readbuffer = self.readbuffer[package_length:]
                 return header, data
-            else:
-                print("not whole package")
-        else:
-            print("not whole header")
+        # else:
+        #         log("not whole package")
+        # else:
+        #     log("not whole header")
         return None
 
+    def _package(self, command, user_fd, data=b''):
+        return struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
+
+
+class OSReadWriteMixin:
+    def _read_chunk(self, fd):
+        chunk = b''
+        try:
+            while True:  # read all data currently available
+                # tmp = fd.recv(3)
+                tmp = os.read(fd, 1024)
+                if tmp == b'':
+                    raise SocketBrokenException()
+                # log("tmp is: {}".format(tmp))
+                chunk += tmp
+                if len(tmp) < 1024:
+                    break
+        except ConnectionResetError:
+            log('connectionReset!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            raise SocketBrokenException()
+        except BlockingIOError:  # if no data available, python throw this error if non-blocking socket is used
+            log("blockio error!!!")
+            pass
+        log("{} get new chunk: {}".format(fd, chunk))
+        return chunk
+
+    def _write_chunk(self, fd):
+        l = os.write(fd, self.send_buffers[fd])
+        self.send_buffers[fd] = self.send_buffers[fd][l:]
+
+
+# connection from proxy client
+class ClientConnection(BaseConnection, ParsableMixin):
+    def __init__(self, sock, server):
+        super().__init__(sock)
+        self.server = server
+        self.user_server = None
+
+    def recv(self, new_data):
+        self.readbuffer += new_data
+        while True:
+            packet = self._parse()
+            if packet:
+                self.process(packet)
+            else:
+                break
+
     def process(self, packet):
-        print("processing packet: {}".format(packet))
+        log("processing packet: {}".format(packet))
         header = packet[0]
         data = packet[1]
+        command = header['command']
 
-        if header['command'] == COMMAND_NEW_REQUEST:  # new proxy request
-            print("should add a new user port")
+        if command == COMMAND_NEW_REQUEST:  # new proxy request
+            log("should add a new user port")
             user_server = self.server.add_user_server(self.fileno())
             if user_server:
                 self.user_server = user_server
@@ -95,19 +136,21 @@ class ClientConnection(BaseConnection):
             else:
                 response = self._package(COMMAND_NEW_FAILED, 0, b'')
             self.server.send_data(self.fileno(), response)
-        elif header['command'] == COMMAND_PROXY:
-            print("should proxy the data: {}".format(data))
+        elif command == COMMAND_PROXY:
+            log("should proxy the data: {}".format(data))
             self.server.send_data(header['user_fd'], data)
-            # TODO: check if peer is closed, if so, return error code to let client close its port # really need check??
+        elif command == COMMAND_APP_GONE:
+            log("app close socket for user {}".format(header['user_fd']))
+            self.server.app_gone(header['user_fd'])
 
     def user_gone(self, fd):
-        print("user {} closed, notify the client: {}".format(fd, self.fileno()))
+        log("user {} closed, notify the client: {}".format(fd, self.fileno()))
         response = self._package(COMMAND_USER_GONE, fd, b'')
         self.server.send_data(self.fileno(), response)
 
 
 # connection from end user
-class UserConnection(BaseConnection):
+class UserConnection(BaseConnection, ParsableMixin):
     def __init__(self, sock, client_fd, server_fd):
         super().__init__(sock)
         self.client_fd = client_fd
@@ -122,7 +165,7 @@ class UserConnection(BaseConnection):
         self.process()
 
     def process(self):
-        print("got new data: {}".format(self.readbuffer))
+        log("got new data: {}".format(self.readbuffer))
         response = self._package(COMMAND_PROXY, self.fileno(), self.readbuffer)
         self.readbuffer = b''
         self.proxy_server.send_data(self.client_fd, response)
@@ -140,27 +183,27 @@ class UserServer:
 
     def accept(self):
         new_conn, addr = self.sock.accept()
-        print("new connection from {}:{}".format(addr[0], addr[1]))
+        new_conn.setblocking(False)
+        log("new connection from {}:{}".format(addr[0], addr[1]))
         user_conn = UserConnection(new_conn, self.client_fd, self.sock.fileno())
         self.user_conns[user_conn.fileno()] = user_conn
-        print("user server {} has user conns: {}".format(self.fileno(), self.user_conns))
+        log("user server {} has user conns: {}".format(self.fileno(), self.user_conns), brief=False)
         return user_conn, addr
 
     def user_gone(self, fd):
         self.user_conns.pop(fd, None)
-        print("user server has user conns: {}".format(self.user_conns))
+        log("user server has user conns: {}".format(self.user_conns), brief=False)
 
     # close self and rerun all user connection fds to proxy server to unregister them
     def close(self):
         self.sock.close()
         fd_list = list(self.user_conns.keys())
-        print(fd_list)
-        self.user_conns.clear()  # TODO: !!!!!!!!!!!!!!!!!!!!
+        self.user_conns.clear()
         return fd_list
 
 
 # main proxy server
-class ProxyServer:
+class ProxyServer(OSReadWriteMixin):
     def __init__(self, ip, port):
         self.ip = ip
         self.port = port
@@ -171,32 +214,48 @@ class ProxyServer:
         self.user_servers = {}
         self.user_port_range = (10000, 20000)
         self.send_buffers = {}
+        self.user_fd_close_list = set()
 
     def add_user_server(self, fd):
-        print("{} wants to add a new user server".format(fd))
+        log("{} wants to add a new user server".format(fd))
         s = self._new_user_server_socket()
         user_server = UserServer(s, fd)
         self.user_servers[s.fileno()] = user_server
-        print("new user server socket: {}".format(s))
+        log("new user server socket: {}".format(s))
         self.selectors.register(s.fileno(), selectors.EVENT_READ)
-        print(self.user_servers)
+        log(self.user_servers)
         return user_server
 
     def _new_user_server_socket(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setblocking(False)
-        while True:  # TODO: limit trial times
+        for i in range(0, 20):
             try:
                 # port = random.randint(self.user_port_range[0], self.user_port_range[1])
                 port = 12345  # TODO: change this
                 s.bind((self.ip, port))
                 s.listen(5)
                 return s
-            except OSError:
-                pass
+            except OSError as e:
+                print(e)
+        return None
+
+    def app_gone(self, user_fd):
+        """
+        app closed socket for user_fd
+        :param user_fd:
+        """
+        # if there is unsent data to user, send it before close user connection
+        if self.send_buffers.get(user_fd, None):
+            log("has write buffer, close later")
+            self.user_fd_close_list.add(user_fd)
+        else:
+            log("no write buffer, close now")
+            self.user_servers[self.user_conns[user_fd].server_fd].user_gone(user_fd)
+            self._close_user(user_fd)
 
     def send_data(self, fd, packet):
-        print("{} wants to send data: {}".format(fd, packet))
+        log("gonna send data to {}: {}".format(fd, packet))
         self.send_buffers[fd] = self.send_buffers.get(fd, b'') + packet
         self.selectors.modify(fd, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
@@ -206,73 +265,80 @@ class ProxyServer:
         self.sock.bind((self.ip, self.port))
         self.sock.listen(5)
 
-        self.selectors.register(self.sock, selectors.EVENT_READ)
+        self.selectors.register(self.sock.fileno(), selectors.EVENT_READ)  # TODO: wrap selector to work with exceptions
 
-        # TODO:need a thread to check heartbeats
-
-        print("start listening on port {}".format(self.port))
+        log("start listening on port {}".format(self.port))
         while True:
-            print("=========\nwaiting for I/O")
-            print("memory usage: {}".format(self._show_memory()))
-            for key, event in self.selectors.select(100):
+            log("=========\nwaiting for I/O")
+            log("memory usage: {}".format(self._show_memory()))
+            for key, event in self.selectors.select(30):
                 fd = key.fileobj
 
                 if event == selectors.EVENT_READ:
                     # 1.ProxyServer
-                    if fd == self.sock:  # server listening socket
+                    if fd == self.sock.fileno():  # server listening socket
                         new_conn, addr = self.sock.accept()
-                        print("new connection from {}:{}".format(addr[0], addr[1]))
+                        new_conn.setblocking(False)
+                        log("new connection from {}:{}".format(addr[0], addr[1]))
                         self.selectors.register(new_conn.fileno(), selectors.EVENT_READ)
                         self.client_conns[new_conn.fileno()] = ClientConnection(new_conn, self)
-                        print(self.client_conns)
+                        log(self.client_conns, brief=False)
 
                     # 2.UserServer
                     elif self.user_servers.get(fd, None):
-                        print("user server {} has new connection".format(fd))
+                        log("user server {} has new connection".format(fd))
                         user_conn, addr = self.user_servers[fd].accept()
                         self.selectors.register(user_conn.fileno(), selectors.EVENT_READ)
                         self.user_conns[user_conn.fileno()] = user_conn
                         user_conn.set_proxy_server(self)
-                        print(self.user_conns)
+                        log(self.user_conns, brief=False)
 
                     # 3.ClientConnection
                     elif self.client_conns.get(fd, None):
-                        print("new read event from client connection {}".format(fd))
+                        log("new read event from client connection {}".format(fd))
                         try:
                             self.client_conns[fd].recv(self._read_chunk(fd))
                         except SocketBrokenException:
                             self._close_client(fd)
                     # 4.UserConnection
                     elif self.user_conns.get(fd, None):
-                        print("new read event from user connection {}".format(fd))
+                        log("new read event from user connection {}".format(fd))
                         try:
                             self.user_conns[fd].recv(self._read_chunk(fd))
                         except SocketBrokenException:
-                            print("user closed")
+                            log("user closed")
                             self._close_user(fd, True)
 
                 elif event == selectors.EVENT_WRITE:
+                    # 1.ClientConnection or 2.UserConnection
+                    if self.client_conns.get(fd, None) or self.user_conns.get(fd, None):
+                        log("new write event from client {}".format(fd))
+                        log("packet to send is: {}".format(self.send_buffers[fd]))
+                        self._write_chunk(fd)
+                        if self.send_buffers[fd] == b'':
+                            self.selectors.modify(fd, selectors.EVENT_READ)
 
-                    # TODO: refactor two if to one
-                    # TODO: what if error happens on write
-                    # 1.ClientConnection
-                    if self.client_conns.get(fd, None):
-                        print("new write event from client {}".format(fd))
-                        print("packet to send is: {}".format(self.send_buffers[fd]))
-                        self._write_chunk(fd)
-                        self.selectors.modify(fd, selectors.EVENT_READ)
-                    # 2.UserConnection
-                    elif self.user_conns.get(fd, None):
-                        print("new write event from user {}".format(fd))
-                        print("packet to send is: {}".format(self.send_buffers[fd]))
-                        self._write_chunk(fd)
-                        self.selectors.modify(fd, selectors.EVENT_READ)
-                else:
-                    print("surprise event??? fd: {}, event: {}".format(fd, event))
-                    self.selectors.unregister(fd)
+            # TODO:need a thread to check heartbeats
+            self._check_heartbeats()
+
+            # close listed user conns
+            self._close_user_list()
+
+    def _close_user_list(self):
+        if len(self.user_fd_close_list) > 0:
+            log("close user list")
+            log(self.user_fd_close_list)
+            for fd in set(self.user_fd_close_list):
+                if self.send_buffers.get(fd, b'') == b'':
+                    self._close_user(fd)
+                    self.user_fd_close_list.remove(fd)
+            log(self.user_fd_close_list)
+
+    def _check_heartbeats(self):
+        pass
 
     def _close_client(self, fd):
-        print("client closed")
+        log("client closed")
         client_conn = self.client_conns[fd]
         # 1.unregister own
         self.selectors.unregister(fd)
@@ -281,15 +347,15 @@ class ProxyServer:
         # 3.clear buffers
         self.client_conns.pop(fd, None)
         self.send_buffers.pop(fd, None)
-        print("client conns: {}".format(self.client_conns))
+        log("client conns: {}".format(self.client_conns), brief=False)
 
         if client_conn.user_server:
-            print("closing related user server")
+            log("closing related user server")
             # 1.unregister user server
             self.selectors.unregister(client_conn.user_server.fileno())
             # 2.close related user server
             user_fd_list = client_conn.user_server.close()
-            print("user fd list: {}".format(user_fd_list))
+            log("user fd list: {}".format(user_fd_list), brief=False)
             # 3.remove user server from user_server list
             self.user_servers.pop(client_conn.user_server.fileno(), None)
             self.send_buffers.pop(client_conn.user_server.fileno(), None)
@@ -311,30 +377,7 @@ class ProxyServer:
         # 5.clear buffers
         self.user_conns.pop(fd, None)
         self.send_buffers.pop(fd, None)
-        print(self.user_conns)
-
-    def _read_chunk(self, fd):
-        chunk = b''
-        try:
-            while True:  # read all data currently available
-                # tmp = fd.recv(3)
-                tmp = os.read(fd, 3)
-                if tmp == b'':
-                    raise SocketBrokenException()
-                print("tmp is: {}".format(tmp))
-                chunk += tmp
-                if len(tmp) < 3:
-                    break
-        except BlockingIOError:  # if no data available, python throw this error if non-blocking socket is used
-            print("blockio error!!!")
-            pass
-        print("{} get new chunk: {}".format(fd, chunk))
-        return chunk
-
-    def _write_chunk(self, fd):
-        # TODO: write error check;  may not be able to write all data at once?
-        os.write(fd, self.send_buffers[fd])
-        self.send_buffers[fd] = b''
+        log(self.user_conns, brief=False)
 
     @staticmethod
     def _show_memory():
@@ -342,64 +385,55 @@ class ProxyServer:
 
 
 # proxy client
-class Client:
+class Client(ParsableMixin, OSReadWriteMixin):
     def __init__(self, server_ip, server_port, app_ip, app_port):
+        super().__init__()
         self.server_ip = server_ip
         self.server_port = server_port
         self.app_ip = app_ip
         self.app_port = app_port
         self.selectors = selectors.DefaultSelector()
         self.server = None
-        self.app_conns = {}         # app socket fd => socket obj
-        self.user_fd_map = {}       # user fd => app socket fd
-        self.app_conn_map = {}      # app socket fd => user fd
+        self.app_conns = {}  # app socket fd => socket obj
+        self.user_fd_map = {}  # user fd => app socket fd
+        self.app_conn_map = {}  # app socket fd => user fd
         self.app_port_range = (10000, 20000)
         self.send_buffers = {}
         self.readbuffer = b''
+        self.app_fd_close_list = set()
 
     def _recv(self, new_data):
         self.readbuffer += new_data
-        packet = self._parse()
-        if packet:
-            self._process(packet)
-
-    def _parse(self):  # TODO: should be put in a while loop ??
-        print("parsing protocol")
-        if len(self.readbuffer) >= HEADER_LENGTH:
-            command, checksum, user_fd, data_length = struct.unpack('!BHHL', self.readbuffer[:HEADER_LENGTH])
-            header = {
-                'command': command,
-                'checksum': checksum,
-                'user_fd': user_fd,
-                'data_length': data_length
-            }
-
-            package_length = HEADER_LENGTH + data_length
-            if len(self.readbuffer) >= package_length:
-                data = self.readbuffer[HEADER_LENGTH: package_length]
-                self.readbuffer = self.readbuffer[package_length:]
-                return header, data
+        while True:
+            packet = self._parse()
+            if packet:
+                self._process(packet)
             else:
-                print("not whole package")
-        else:
-            print("not whole header")
-        return None
+                break
 
     def _process(self, packet):
-        print("processing packet: {}".format(packet))
+        log("processing packet: {}".format(packet))
         header = packet[0]
         data = packet[1]
 
         if header['command'] == COMMAND_NEW_FAILED:  # new proxy request
-            print("server refused")
+            log("server refused")
             sys.exit(1)
         elif header['command'] == COMMAND_PROXY:
-            print("should proxy the data: {}".format(data))
+            log("should proxy the data: {}".format(data))
             self._send_app_data(header['user_fd'], data)
-        # TODO: user gone
+        elif header['command'] == COMMAND_USER_GONE:
+            user_fd = header['user_fd']
+            app_fd = self.user_fd_map.get(user_fd, None)
+            if app_fd is None:
+                return
+            if self.send_buffers.get(app_fd, None):
+                self.app_fd_close_list.add(app_fd)
+            else:
+                log("user {} gone".format(user_fd))
+                self._close_app(app_fd)
 
     def _send_app_data(self, user_fd, data):
-        print("send data {} to app for user {}".format(data, user_fd))
         app_fd = self.user_fd_map.get(user_fd, None)
         if app_fd is None:
             # 1. new socket
@@ -412,15 +446,34 @@ class Client:
             self.user_fd_map[user_fd] = app_fd
             self.app_conns[app_fd] = s
             self.app_conn_map[app_fd] = user_fd
-
-        self.send_buffers[app_fd] = self.send_buffers.get(app_fd, b'') + data
-        self.selectors.modify(app_fd, selectors.EVENT_READ | selectors.EVENT_WRITE)
+        log("send data to app {} for user {}: {}".format(app_fd, user_fd, data))
+        self._send_data(app_fd, data)
 
     def _proxy_data(self, app_fd, data):
-        print("send data {} to user {}".format(data, self.app_conn_map[app_fd]))
+        """
+        send data from app to server
+        :param app_fd:
+        :param data: bytes
+        """
+        log("send data {} to user {}".format(data, self.app_conn_map[app_fd]))
         packet = self._package(COMMAND_PROXY, self.app_conn_map[app_fd], data)
-        self.send_buffers[self.server.fileno()] = packet
-        self.selectors.modify(self.server, selectors.EVENT_READ | selectors.EVENT_WRITE)
+        self._send_data(self.server.fileno(), packet)
+
+    def _send_command(self, data):
+        """
+        send command to server
+        :param data:
+        """
+        self._send_data(self.server.fileno(), data)
+
+    def _send_data(self, fd, data):
+        """
+        put data to send buffers
+        :param fd:
+        :param data: bytes
+        """
+        self.send_buffers[fd] = self.send_buffers.get(fd, b'') + data
+        self.selectors.modify(fd, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
     def start_client(self):
         # 1.check app info
@@ -429,7 +482,7 @@ class Client:
             app_socket.connect((self.app_ip, self.app_port))
             app_socket.close()
         except ConnectionRefusedError:
-            print("app not exists")
+            log("app not exists")
             sys.exit(1)
 
         # 2.connect server
@@ -437,110 +490,93 @@ class Client:
             self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server.connect((self.server_ip, self.server_port))
         except ConnectionRefusedError:
-            print("server not exists")
+            log("server not exists")
             sys.exit(1)
         # 3.send request command
-        print("send request")
+        log("send request")
         self.server.send(self._package(COMMAND_NEW_REQUEST, 0, b''))
         self.server.setblocking(False)
-        self.selectors.register(self.server, selectors.EVENT_READ)
+        self.selectors.register(self.server.fileno(), selectors.EVENT_READ)
 
         # 4.proxy data
-        # TODO:need a thread to send hearbeat         ????? really need??
-        print("start proxy for {}:{}".format(self.app_ip, self.app_port))
+        log("start proxy for {}:{}".format(self.app_ip, self.app_port))
         while True:
-            print("=========\nwaiting for I/O")
-            for key, event in self.selectors.select(100):
+            log("=========\nwaiting for I/O")
+            for key, event in self.selectors.select(400):
                 fd = key.fileobj
-                print(fd, event)
+                # log(fd, event)
 
                 if event == selectors.EVENT_READ:
                     # 1.ProxyServer
-                    if fd == self.server:
-                        print("new read event from server")
+                    if fd == self.server.fileno():
+                        log("new read event from server")
                         try:
-                            self._recv(self._read_chunk(fd.fileno()))
+                            self._recv(self._read_chunk(fd))
                         except SocketBrokenException:
                             self._close_server()
                     # 2.AppConnection
                     elif self.app_conns.get(fd, None):
-                        print("new read event from app connection {}".format(fd))
+                        log("new read event from app connection {}".format(fd))
                         try:
                             self._proxy_data(fd, self._read_chunk(fd))
                         except SocketBrokenException:
-                            print("app closed")
+                            log("app {} closed".format(fd))
                             self._close_app(fd, True)
 
                 elif event == selectors.EVENT_WRITE:
-
-                    # TODO: refactor two if to one
-                    # TODO: what if error happens on write
-                    # 1.AppConnection
-                    if self.app_conns.get(fd, None):
-                        print("new write event for app {}".format(fd))
-                        print("packet to send is: {}".format(self.send_buffers[fd]))
+                    # 1.AppConnection or 2.ProxyServer
+                    if self.app_conns.get(fd, None) or fd == self.server.fileno():
+                        log("new write event for {}".format(fd))
+                        log("packet to send is: {}".format(self.send_buffers[fd]))
                         self._write_chunk(fd)
-                        self.selectors.modify(fd, selectors.EVENT_READ)
-                    # 2.ProxyServer
-                    elif fd == self.server:
-                        print("new write event from server")
-                        print("packet to send is: {}".format(self.send_buffers[fd.fileno()]))
-                        self._write_chunk(fd.fileno())
-                        self.selectors.modify(fd, selectors.EVENT_READ)
+                        if self.send_buffers[fd] == b'':
+                            self.selectors.modify(fd, selectors.EVENT_READ)
                 else:
-                    print("surprise event??? fd: {}, event: {}".format(fd, event))
+                    log("surprise event??? fd: {}, event: {}".format(fd, event))
                     self.selectors.unregister(fd)
 
+            # TODO:send hearbeat
+            self._send_heartbeat()
+
+            # close listed app conns
+            self._close_app_list()
+
+    def _close_app_list(self):
+        if len(self.app_fd_close_list) > 0:
+            log("close app list")
+            log(self.app_fd_close_list)
+            for fd in set(self.app_fd_close_list):
+                if self.send_buffers.get(fd, b'') == b'':
+                    self.app_fd_close_list.remove(fd)
+                    self._close_app(fd)
+            log(self.app_fd_close_list)
+
+    def _send_heartbeat(self):
+        pass
+
     def _close_server(self):
-        print("server closed")
+        log("server closed")
         sys.exit(1)
 
-    def _close_app(self, fd, need_notify=False):
+    def _close_app(self, fd, neednotify=False):
         app_conn = self.app_conns[fd]
         # 1.unregister it from selectors
         self.selectors.unregister(fd)
         # 2.close own socket
         app_conn.close()
 
-        # TODO: notify server
-        # if need_notify:
-        #     # 3.notify the server
-        #     self.user_servers[app_conn.server_fd].user_gone(fd)
-        #     # 4.notify the client
-        #     self.client_conns[app_conn.client_fd].user_gone(fd)
-        # 5.clear buffers
+        # 3.clear buffers
         user_fd = self.app_conn_map[fd]
         self.app_conns.pop(fd, None)
-        self.user_fd_map.pop(user_fd,None)
+        self.user_fd_map.pop(user_fd, None)
         self.app_conn_map.pop(fd, None)
         self.send_buffers.pop(fd, None)
-        print(self.app_conns)
 
-    def _read_chunk(self, fd):
-        chunk = b''
-        try:
-            while True:  # read all data currently available
-                # tmp = fd.recv(3)
-                tmp = os.read(fd, 3)
-                if tmp == b'':
-                    raise SocketBrokenException()
-                print("tmp is: {}".format(tmp))
-                chunk += tmp
-                if len(tmp) < 3:
-                    break
-        except BlockingIOError:  # if no data available, python throw this error if non-blocking socket is used
-            print("blockio error!!!")
-            pass
-        print("{} get new chunk: {}".format(fd, chunk))
-        return chunk
+        # 4.notify the server
+        if neednotify:
+            self._send_command(self._package(COMMAND_APP_GONE, user_fd))
+        log(self.app_conns)
 
-    def _write_chunk(self, fd):
-        # TODO: write error check;  may not be able to write all data at once?
-        os.write(fd, self.send_buffers[fd])
-        self.send_buffers[fd] = b''
-
-    def _package(self, command, user_fd, data):
-        return struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
 
 if __name__ == '__main__':
     pass
