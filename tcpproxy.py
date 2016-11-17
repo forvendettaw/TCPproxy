@@ -6,6 +6,7 @@ import random
 import os
 import sys
 import time
+import hashlib
 
 
 def log(*args, brief=True):
@@ -19,8 +20,8 @@ class SocketBrokenException(Exception):
     pass
 
 
-# class WrongProtocolException(Exception):
-#     pass
+class WrongChecksumException(Exception):
+    pass
 
 
 COMMAND_NEW_REQUEST = 1
@@ -33,6 +34,7 @@ COMMAND_HEARTBEAT_PING = 7
 
 HEADER_LENGTH = 9
 HEARTBEAT_INTERVAL = 40
+CHECKSUM_SALT = b'hello world'
 
 
 # BEFORE_HANDSHAKE = 0
@@ -66,20 +68,42 @@ class ParsableMixin:
                 'data_length': data_length
             }
 
-            package_length = HEADER_LENGTH + data_length
-            if len(self.readbuffer) >= package_length:
-                data = self.readbuffer[HEADER_LENGTH: package_length]
-                self.readbuffer = self.readbuffer[package_length:]
-                return header, data
+            packet_length = HEADER_LENGTH + data_length
+            if len(self.readbuffer) >= packet_length:
+                packet = self.readbuffer[:packet_length]
+                if self._check_checksum(packet):
+                    data = self.readbuffer[HEADER_LENGTH: packet_length]
+                    self.readbuffer = self.readbuffer[packet_length:]
+                    return header, data
+                else:
+                    raise WrongChecksumException()
         # else:
         #         log("not whole package")
         # else:
         #     log("not whole header")
         return None
 
+    @classmethod
+    def _check_checksum(cls, packet):
+        log("checking checksum")
+        return cls._cal_checksum(packet) == packet[1:3]
+
+    @classmethod
+    def _add_checksum(cls, packet):
+        check_sum = cls._cal_checksum(packet)
+        return packet[:1] + check_sum + packet[3:]
+
     @staticmethod
-    def _package(command, user_fd, data=b''):
-        return struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
+    def _cal_checksum(packet):
+        whole = packet[:1] + b'\x00\x00' + packet[3:] + CHECKSUM_SALT
+        md5 = hashlib.md5()
+        md5.update(whole)
+        return md5.digest()[:2]
+
+    @classmethod
+    def _package(cls, command, user_fd, data=b''):
+        packet = struct.pack('!BHHL', command, 0, user_fd, len(data)) + data
+        return cls._add_checksum(packet)
 
 
 class OSReadWriteMixin:
@@ -123,12 +147,16 @@ class ClientConnection(BaseConnection, ParsableMixin):
 
     def recv(self, new_data):
         self.readbuffer += new_data
-        while True:
-            packet = self._parse()
-            if packet:
-                self.process(packet)
-            else:
-                break
+        try:
+            while True:
+                packet = self._parse()
+                if packet:
+                    self.process(packet)
+                else:
+                    break
+        except WrongChecksumException:
+            log("wrong checksum, close client")
+            self.server.wrong_client(self.fileno())
 
     def process(self, packet):
         log("processing packet: {}".format(packet))
@@ -249,7 +277,7 @@ class ProxyServer(OSReadWriteMixin):
         for i in range(0, 20):
             try:
                 port = random.randint(self.user_port_range[0], self.user_port_range[1])
-                # port = 12345  # TODO: change this
+                # port = 12345
                 s.bind((self.ip, port))
                 s.listen(5)
                 return s
@@ -271,13 +299,16 @@ class ProxyServer(OSReadWriteMixin):
             self.user_servers[self.user_conns[user_fd].server_fd].user_gone(user_fd)
             self._close_user(user_fd)
 
+    def wrong_client(self, client_fd):
+        self._close_client(client_fd)
+
     def send_data(self, fd, packet):
         log("gonna send data to {}: {}".format(fd, packet))
         self.send_buffers[fd] = self.send_buffers.get(fd, b'') + packet
         self.selectors.modify(fd, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
     def start_serve(self):
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)  # TODO: comment this
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         self.sock.setblocking(False)
         self.sock.bind((self.ip, self.port))
         self.sock.listen(5)
@@ -335,7 +366,7 @@ class ProxyServer(OSReadWriteMixin):
                         if self.send_buffers[fd] == b'':
                             self.selectors.modify(fd, selectors.EVENT_READ)
 
-            # TODO:check heartbeats
+            # check heartbeats
             self._check_heartbeats()
 
             # close listed user conns
@@ -428,12 +459,16 @@ class Client(ParsableMixin, OSReadWriteMixin):
 
     def _recv(self, new_data):
         self.readbuffer += new_data
-        while True:
-            packet = self._parse()
-            if packet:
-                self._process(packet)
-            else:
-                break
+        try:
+            while True:
+                packet = self._parse()
+                if packet:
+                    self._process(packet)
+                else:
+                    break
+        except WrongChecksumException:
+            log("wrong checksum, close client")
+            self._close_server()
 
     def _process(self, packet):
         log("processing packet: {}".format(packet))
